@@ -16,3 +16,6 @@ sound/pci/hdsp/hdspe/*.mod.c
 # IDE files
 .idea/
 .vscode/
+
+# Nix build output
+/result
