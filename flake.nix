@@ -15,7 +15,7 @@
 		}:
 		stdenv.mkDerivation {
 			pname = "snd-hdspe";
-			version = "1.0.3";
+			version = "1.0.4";
 
 			src = self;
 
@@ -30,8 +30,9 @@
 			];
 
 			installPhase = ''
-				install -D sound/pci/hdsp/hdspe/snd-hdspe.ko \
-					$out/lib/modules/${kernel.modDirVersion}/extra/snd-hdspe.ko
+				runHook preInstall
+				install -D snd-hdspe.ko $out/lib/modules/${kernel.modDirVersion}/extra/snd-hdspe.ko
+				runHook postInstall
 			'';
 
 			meta = with lib; {
