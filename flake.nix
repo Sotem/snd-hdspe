@@ -4,6 +4,9 @@
 
 	outputs = { self, nixpkgs }: 
 	let
+		system = "x86_64-linux";
+		pkgs = nixpkgs.legacyPackages.${system};
+		
 		snd-hdspe = {
 			lib,
 			stdenv,
@@ -40,7 +43,7 @@
 		};
 	in {
 
-		packages.x86_64-linux.default = nixpkgs.legacyPackages.x86_64-linux.linuxPackages.callPackage snd-hdspe {};
+		packages.${system}.default = pkgs.linuxPackages.callPackage snd-hdspe {};
 
 		nixosModules.default = { config, lib, ... }: {
 			
