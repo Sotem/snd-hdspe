@@ -1,40 +1,160 @@
-obj-m += sound/pci/hdsp/
+# Module metadata
+PACKAGE_NAME := snd-hdspe
+PACKAGE_VERSION := 1.0.3+develop
 
-# The runtime of DKMS has this environment variable to build for several versions of Linux kernel.
-ifndef KERNELRELEASE
-KERNELRELEASE := $(shell uname -r)
+# Direct module definition
+obj-m += $(PACKAGE_NAME).o
+
+# List all object files explicitly for better DKMS compatibility
+$(PACKAGE_NAME)-y := \
+	sound/pci/hdsp/hdspe/hdspe_core.o \
+	sound/pci/hdsp/hdspe/hdspe_common.o \
+	sound/pci/hdsp/hdspe/hdspe_control.o \
+	sound/pci/hdsp/hdspe/hdspe_hwdep.o \
+	sound/pci/hdsp/hdspe/hdspe_mixer.o \
+	sound/pci/hdsp/hdspe/hdspe_pcm.o \
+	sound/pci/hdsp/hdspe/hdspe_proc.o \
+	sound/pci/hdsp/hdspe/hdspe_madi.o \
+	sound/pci/hdsp/hdspe/hdspe_aes.o \
+	sound/pci/hdsp/hdspe/hdspe_raio.o \
+	sound/pci/hdsp/hdspe/hdspe_midi.o \
+	sound/pci/hdsp/hdspe/hdspe_tco.o \
+	sound/pci/hdsp/hdspe/hdspe_ltc_math.o
+
+# Get version info for embedding into driver logging
+VERSION_H := sound/pci/hdsp/hdspe/hdspe_version.h
+SRCDIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
+GIT_HASH := $(shell git -C $(SRCDIR) rev-parse --short HEAD 2>/dev/null)
+GIT_DESCRIBE := $(shell git -C $(SRCDIR) describe --always --dirty 2>/dev/null)
+ifeq ($(GIT_HASH),)
+GIT_HASH := unknown
+GIT_DESCRIBE := unknown
+GIT_AVAILABLE := 0
+else
+GIT_AVAILABLE := 1
 endif
 
-KDIR    ?= /lib/modules/${KERNELRELEASE}/build
-PWD     := $(shell pwd)
-EXTRA_CFLAGS += -DDEBUG -DCONFIG_SND_DEBUG
+# Add include path for header files
+ccflags-y += -I$(src)/sound/pci/hdsp/hdspe
 
-# Force to build the module as loadable kernel module.
-# Keep in mind that this configuration sound be in 'sound/pci/Kconfig' when upstreaming.
-export CONFIG_SND_HDSPE=m
+# Debug and warning flags
+DEBUG ?= 0
+CONFIG_SND_DEBUG ?= 0
+WARNINGS ?= 0
 
-default: depend
-	$(MAKE) W=1 -C $(KDIR) M=$(PWD) modules
+ccflags-y += $(if $(filter 1,$(DEBUG)),-DDEBUG,)
+ccflags-y += $(if $(filter 1,$(CONFIG_SND_DEBUG)),-DCONFIG_SND_DEBUG,)
+# W can only be W=1/2/3
+WFLAG := $(if $(filter 1 2 3,$(WARNINGS)),W=$(WARNINGS),)
+
+# Set default kernel directory and path variables.
+KERNELRELEASE ?= $(shell uname -r)
+KDIR ?= /lib/modules/$(KERNELRELEASE)/build
+PWD := $(shell pwd)
+
+# --- Standard Build Targets ---
+# These are the only targets needed for DKMS to work.
+# They are also used for manual compilation.
+
+all: modules
+
+# Generate header with version info (compatible with manual builds and DKMS builds)
+
+$(VERSION_H): FORCE
+	@mkdir -p $(dir $@)
+	@if [ "$(GIT_AVAILABLE)" = 0 ] && [ -f "$@" ]; then exit 0; fi; \
+	tmp="$@.tmp"; \
+	{ \
+	  echo '/* Auto-generated. Do not edit. */'; \
+	  echo '#ifndef _SND_HDSPE_VERSION_H_'; \
+	  echo '#define _SND_HDSPE_VERSION_H_'; \
+	  echo ''; \
+	  echo '#define SND_HDSPE_GIT_HASH "$(GIT_HASH)"'; \
+	  echo '#define SND_HDSPE_VERSION "$(GIT_DESCRIBE)"'; \
+	  echo ''; \
+	  echo '#endif /* _SND_HDSPE_VERSION_H_ */'; \
+	} > "$$tmp"; \
+	if [ -f "$@" ] && cmp -s "$$tmp" "$@"; then \
+	  rm -f "$$tmp"; \
+	else \
+	  mv -f "$$tmp" "$@"; \
+	fi
+
+.PHONY: FORCE
+FORCE:
+
+modules: dkms.conf $(VERSION_H)
+	$(MAKE) $(WFLAG) -C $(KDIR) M=$(PWD) modules
+
+dkms.conf: dkms.conf.in
+	@echo "Generating dkms.conf from template..."
+	@sed -e "s/@PACKAGE_NAME@/$(PACKAGE_NAME)/g" \
+	    -e "s/@PACKAGE_VERSION@/$(PACKAGE_VERSION)/g" \
+	    $< > $@
 
 clean:
-	$(MAKE) W=1 -C $(KDIR) M=$(PWD) clean
-	-rm *~
-	-touch deps
+	$(MAKE) $(WFLAG) -C $(KDIR) M=$(PWD) clean
+	@rm -f *~ dkms.conf $(PACKAGE_NAME)-$(PACKAGE_VERSION)
 
-insert: default
-	-rmmod snd-hdspm
-	insmod sound/pci/hdsp/hdspe/snd-hdspe.ko
+insert: all remove-mainlined
+	sudo insmod $(PACKAGE_NAME).ko
 
 remove:
-	rmmod snd-hdspe
+	-@sudo modprobe -r $(PACKAGE_NAME) 2>/dev/null || sudo rmmod $(PACKAGE_NAME) 2>/dev/null || true
 
-install: default
-	-rmmod snd-hdspm
-	-ln -s $(pwd) /usr/src/alsa-hdspe-0.0
-	dkms install alsa-hdspe/0.0
+remove-mainlined:
+	@if lsmod | grep -q '^snd_hdspm '; then \
+		sudo rmmod snd_hdspm; \
+	fi
+
+# --- DKMS Convenience Targets for Manual Installation ---
+# These targets are helpful for developers.
+DKMS_SRC_PATH := /usr/src/$(PACKAGE_NAME)-$(PACKAGE_VERSION)
+
+install: all remove-mainlined
+	@echo "Installing module into DKMS tree for manual use..."
+	-sudo rm -rf $(DKMS_SRC_PATH)
+	sudo mkdir -p $(DKMS_SRC_PATH)
+	sudo cp -r Makefile dkms.conf* sound $(DKMS_SRC_PATH)/
+	-sudo dkms remove -m $(PACKAGE_NAME) -v $(PACKAGE_VERSION) -k $(KERNELRELEASE) 2>/dev/null || true
+	-sudo dkms add -m $(PACKAGE_NAME) -v $(PACKAGE_VERSION) 2>/dev/null || true
+	sudo dkms build -m $(PACKAGE_NAME) -v $(PACKAGE_VERSION) -k $(KERNELRELEASE)
+	sudo dkms install -m $(PACKAGE_NAME) -v $(PACKAGE_VERSION) -k $(KERNELRELEASE)
 
 uninstall:
-	dkms remove alsa-hdspe/0.0 --all
+	@echo "Unloading and removing module from DKMS tree for current kernel $(KERNELRELEASE)..."
+	-@sudo modprobe -r $(PACKAGE_NAME) 2>/dev/null || sudo rmmod $(PACKAGE_NAME) 2>/dev/null || true
+	-@sudo dkms remove -m $(PACKAGE_NAME) -v $(PACKAGE_VERSION) -k $(KERNELRELEASE) 2>/dev/null || true
+	# In case of leftover files blocking DKMS you can uncomment this
+	#-@sudo rm -rf "$(DKMS_SRC_PATH)" 2>/dev/null || true
+	#-@sudo rm -f "/lib/modules/$(KERNELRELEASE)/updates/dkms/$(PACKAGE_NAME).ko"* 2>/dev/null || true
+
+uninstall-all:
+	@echo "Unloading and removing all versions of $(PACKAGE_NAME) from DKMS tree..."
+	-@sudo modprobe -r $(PACKAGE_NAME) 2>/dev/null || sudo rmmod $(PACKAGE_NAME) 2>/dev/null || true
+	-@for ver in $$(dkms status -m $(PACKAGE_NAME) 2>/dev/null | awk -F'[/,:]' '{print $$2}' | sort -u); do \
+	  [ -n "$$ver" ] || continue; \
+	  echo "Removing $(PACKAGE_NAME)/$$ver..."; \
+	  sudo dkms remove -m $(PACKAGE_NAME) -v "$$ver" --all 2>/dev/null || true; \
+	done
+	# In case of leftover files blocking DKMS you can uncomment this
+	#-@sudo rm -rf "/usr/src/$(PACKAGE_NAME)-"* 2>/dev/null || true
+	#-@sudo rm -rf "/var/lib/dkms/$(PACKAGE_NAME)" 2>/dev/null || true
+	#-@sudo find /lib/modules -type f -path "*/updates/dkms/$(PACKAGE_NAME).ko*" -exec sudo rm -f {} + 2>/dev/null || true
+
+# Generate compilation database for IDE integration
+compiledb:
+	@which bear > /dev/null || (echo "Error: 'bear' tool not found. Please install it for IDE integration." && exit 1)
+	@if [ ! -f compile_commands.json ] || [ -n "$$(find . -newer compile_commands.json -name "*.c" -o -name "*.h")" ]; then \
+		echo "Generating compilation database for IDE integration..."; \
+		if [ -f compile_commands.json ]; then rm compile_commands.json; fi; \
+		bear -- $(MAKE) W=1 -C $(KDIR) M=$(PWD) modules || true; \
+	else \
+		echo "Compilation database is up to date"; \
+	fi
+
+debug:
+	$(MAKE) CONFIG_SND_DEBUG=1 DEBUG=1 WARNINGS=1
 
 list-controls:
 	-rm asound.state
@@ -42,9 +162,3 @@ list-controls:
 
 show-controls: list-controls
 	less asound.state
-
-enable-debug-log:
-	echo 8 > /proc/sys/kernel/printk
-
-depend:
-	gcc -MM sound/pci/hdsp/hdspe/hdspe*.c > deps

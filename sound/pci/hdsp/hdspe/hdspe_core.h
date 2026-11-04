@@ -10,9 +10,6 @@
  * and hardware kindly made available by Amptec Belgium (www.amptec.be).
  */
 
-/* TODO: undefine in production version */
-#define DEBUG
-#define CONFIG_SND_DEBUG
 //#define TIME_INTERRUPT_INTERVAL
 #define DAW_MODE
 //#define PASSTHROUGH_MODE
@@ -28,11 +25,11 @@
 #include <sound/info.h>
 
 // #define HDSPE_HDSP_REV  60  //  HDSPe PCIe/ExpressCard
-#define HDSPE_MADI_REV		210  // TODO: use
+#define HDSPE_MADI_REV		210
 #define HDSPE_RAYDAT_REV	211
 #define HDSPE_AIO_REV		212
 #define HDSPE_MADIFACE_REV	213
-#define HDSPE_AES_REV		240  // TODO: use
+#define HDSPE_AES_REV		240
 
 /* --- Write registers. ---
   These are defined as byte-offsets from the iobase value.  */
@@ -863,8 +860,8 @@ struct hdspe_tables {
 	const char * const *port_names_out_ds;
 	const char * const *port_names_out_qs;
 
-	const signed char *channel_map_in_ss, *channel_map_in_ds, *channel_map_in_qs;
-	const signed char *channel_map_out_ss, *channel_map_out_ds, *channel_map_out_qs;
+	const s8 *channel_map_in_ss, *channel_map_in_ds, *channel_map_in_qs;
+	const s8 *channel_map_out_ss, *channel_map_out_ds, *channel_map_out_qs;
 	
 	unsigned char ss_in_channels;
 	unsigned char ds_in_channels;
@@ -912,6 +909,11 @@ struct hdspe_ctl_ids {
   /*	struct snd_ctl_elem_id* wck_out_rate; */
 };
 
+struct hdspe_channel_known {
+	bool in[HDSPE_MIXER_CHANNELS];
+	bool pb[HDSPE_MIXER_CHANNELS];
+};
+
 struct hdspe {
 	struct pci_dev *pci;	     /* pci info */
 	int vendor_id;               /* PCI vendor ID: Xilinx or RME */
@@ -920,7 +922,7 @@ struct hdspe {
 	unsigned long port;
 	void __iomem *iobase;
 
-	u16 firmware_rev;            /* determines io_type (card model) */
+	u8  pci_rev_id;              /* determines io_type (card model) */
 	u16 reserved;
 	u32 fw_build;                /* firmware build */
 	u32 serial;                  /* serial nr */
@@ -936,8 +938,8 @@ struct hdspe {
 	struct snd_hwdep *hwdep;     /* and a hwdep for additional ioctl */
   
 	/* Only one playback and/or capture stream */
-        struct snd_pcm_substream *capture_substream;
-        struct snd_pcm_substream *playback_substream;
+	struct snd_pcm_substream *capture_substream;
+	struct snd_pcm_substream *playback_substream;
 
 	/* MIDI */
 	struct hdspe_midi midi[HDSPE_MAX_MIDI];
@@ -967,6 +969,8 @@ struct hdspe {
 	/* Mixer vars */
 	/* full mixer accessible over mixer ioctl or hwdep-device */
 	struct hdspe_mixer *mixer;
+	/* The mixer values we know (have been written at least once) */
+	struct hdspe_channel_known mixer_known[HDSPE_MIXER_CHANNELS];
 	struct hdspe_peak_rms peak_rms;
 	/* fast alsa mixer */
 	struct snd_kcontrol *playback_mixer_ctls[HDSPE_MAX_CHANNELS];
@@ -982,8 +986,8 @@ struct hdspe {
 	/* Channel map and port names - set by hdspe_set_channel_map() */
 	unsigned char max_channels_in;
 	unsigned char max_channels_out;
-	const signed char *channel_map_in;
-	const signed char *channel_map_out;
+	const s8 *channel_map_in;
+	const s8 *channel_map_out;
 	const char * const *port_names_in;
 	const char * const *port_names_out;
 
@@ -1008,6 +1012,8 @@ struct hdspe {
 		union hdspe_status0_reg  status0; /* read at every interrupt */
 	} reg;
 
+	struct reg suspendStateRegs;
+
 	u64 frame_count;            /* current period frame counter */
 	u32 hw_pointer_wrap_count;  /* hw pointer wrapped this many times */
 	u32 last_hw_pointer;        /* previous period hw pointer */
@@ -1015,6 +1021,17 @@ struct hdspe {
 	u32 period_size;            /* current period size, in nr of samples */
 };
 
+/* ------------------------------------------------------- */
+
+/*
+ * Returns true if the card is a RayDAT / AIO / AIO Pro
+ */
+static inline bool hdspe_is_raydat_or_aio(struct hdspe *hdspe)
+{
+	return ((HDSPE_AIO == hdspe->io_type) ||
+		(HDSPE_RAYDAT == hdspe->io_type) ||
+		(HDSPE_AIO_PRO == hdspe->io_type));
+}
 
 /**
  * Write/read to/from HDSPE with Adresses in Bytes
@@ -1049,13 +1066,30 @@ void hdspe_write_control(struct hdspe* hdspe)
 static inline __attribute__((always_inline))
 void hdspe_write_settings(struct hdspe* hdspe)
 {
-	hdspe_write(hdspe, HDSPE_WR_SETTINGS, hdspe->reg.settings.raw);
+	if(hdspe_is_raydat_or_aio(hdspe))
+		hdspe_write(hdspe, HDSPE_WR_SETTINGS, hdspe->reg.settings.raw);
 }
 
 static inline __attribute__((always_inline))
 void hdspe_write_pll_freq(struct hdspe* hdspe)
 {
 	hdspe_write(hdspe, HDSPE_WR_PLL_FREQ, hdspe->reg.pll_freq);
+}
+
+/* Enable/disable DMA for a given out (=playback) channel. */
+static inline __attribute__((always_inline))
+void hdspe_set_dma_out(struct hdspe *hdspe, const int channel, const bool enable_dma)
+{
+	/* Only bit 0 of the written value is relevant. */
+	hdspe_write(hdspe, HDSPE_outputEnableBase + 4 * channel, enable_dma);
+}
+
+/* Enable/disable DMA for a given in (=capture) channel. */
+static inline __attribute__((always_inline))
+void hdspe_set_dma_in(struct hdspe *hdspe, const int channel, const int enable_dma)
+{
+	/* Only bit 0 of the written value is relevant. */
+	hdspe_write(hdspe, HDSPE_inputEnableBase + 4 * channel, enable_dma);
 }
 
 // status0 register is read at every interrupt if audio is started and
@@ -1233,7 +1267,7 @@ extern int hdspe_update_simple_mixer_controls(struct hdspe * hdspe);
 extern void hdspe_mixer_read_proc(struct snd_info_entry *entry,
 				  struct snd_info_buffer *buffer);
 
-extern void hdspe_mixer_update_channel_map(struct hdspe* hdspe);
+extern void hdspe_restore_mixer(struct hdspe *hdspe);
 
 /**
  * hdspe_tco.c
@@ -1263,14 +1297,18 @@ extern bool hdspe_tco_notify_status_change(struct hdspe* hdspe);
 /* Set "app" sample rate on TCO module, when sound card sample rate changes. */
 extern void hdspe_tco_set_app_sample_rate(struct hdspe* hdspe);
 
+/* Write settings to TCO module */
+extern void hdspe_tco_write_settings(struct hdspe* hdspe);
+
+
 /**
  * hdspe_common.c
  */
 
 /* Get name of the clock source */
-extern const char* const hdspe_clock_source_name(struct hdspe* hdspe, int i);
+extern const char* hdspe_clock_source_name(struct hdspe* hdspe, int i);
 /* Get name of the frequency class */
-extern const char* const hdspe_freq_name(enum hdspe_freq f);
+extern const char* hdspe_freq_name(enum hdspe_freq f);
 /* Get frequency class frame rate */
 extern u32 hdspe_freq_sample_rate(enum hdspe_freq f);
 /* Get the frequency class best representing the given rate */

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/**
+/*
  * hdspe_pcm.c
  * @brief RME HDSPe PCM interface.
  *
@@ -15,6 +15,8 @@
 
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
+
+#include <linux/printk.h>
 
 
 /* the size of a substream (1 mono data stream) */
@@ -69,29 +71,6 @@ static void hdspe_set_channel_dma_addr(struct hdspe *hdspe,
 	}
 }
 
-/* enable DMA for specific channels, now available for DSP-MADI */
-static inline void snd_hdspe_enable_in(struct hdspe * hdspe, int i, int v)
-{
-	hdspe_write(hdspe, HDSPE_inputEnableBase + (4 * i), v);
-}
-
-static inline void snd_hdspe_enable_out(struct hdspe * hdspe, int i, int v)
-{
-	hdspe_write(hdspe, HDSPE_outputEnableBase + (4 * i), v);
-}
-
-/* ------------------------------------------------------- */
-
-/**
- * Returns true if the card is a RayDAT / AIO / AIO Pro 
- */
-static inline bool hdspe_is_raydat_or_aio(struct hdspe *hdspe)
-{
-	return ((HDSPE_AIO == hdspe->io_type) ||
-		(HDSPE_RAYDAT == hdspe->io_type) ||
-		(HDSPE_AIO_PRO == hdspe->io_type));
-}
-
 /* return period size in samples per period */
 u32 hdspe_period_size(struct hdspe *hdspe)
 {
@@ -105,9 +84,9 @@ u32 hdspe_period_size(struct hdspe *hdspe)
 	 * it corresponds to 32 samples.
 	 */
 	if ((7 == n) && hdspe_is_raydat_or_aio(hdspe))
-		n = -1;
+		return 32;
 
-	return 64 << n; // 1 << (n + 6);
+	return 64U << n; // 1 << (n + 6);
 }
 
 /* Sets hdspe->period_size and hdspe->hw_buffer_size according to the
@@ -163,8 +142,8 @@ static int hdspe_set_interrupt_interval(struct hdspe *hdspe, unsigned int frames
 snd_pcm_uframes_t hdspe_hw_pointer(struct hdspe *hdspe)
 {
 	/* (BUF_PTR << 6) bytes / 4 bytes per sample */
-	return ((le16_to_cpu(hdspe->reg.status0.common.BUF_PTR)) << 4)
-		& (hdspe->hw_buffer_size - 1);
+	snd_pcm_uframes_t pointer = ((le16_to_cpu(hdspe->reg.status0.common.BUF_PTR)) << 4) & (hdspe->hw_buffer_size - 1);
+    return pointer;
 }
 
 /* Called right from the interrupt handler in order to update the frame
@@ -189,37 +168,31 @@ void hdspe_update_frame_count(struct hdspe* hdspe)
 
 #ifdef DEBUG_FRAME_COUNT
 	{
+		static DEFINE_RATELIMIT_STATE(hdspe_fc_rs, HZ, 1);
 		static u64 last_frame_count =0;
 		static u64 last_hw_pointer =0;
+		u64 delta;
 		hw_pointer = hdspe_hw_pointer(hdspe);
-		dev_dbg(hdspe->card->dev, "%s: hw_pointer=%u (delta %llu), frame_count=%llu (delta=%llu)\n",
-			__func__,
-			hw_pointer,
-			hw_pointer > last_hw_pointer
+		delta = hw_pointer > last_hw_pointer
 			? hw_pointer - last_hw_pointer
-			: (hw_pointer + hdspe->hw_buffer_size) - last_hw_pointer,
-			hdspe->frame_count,
-			hdspe->frame_count - last_frame_count);
+			: (hw_pointer + hdspe->hw_buffer_size) - last_hw_pointer;
+		if (delta > (u64)hdspe->period_size * 4) {
+			dev_warn_ratelimited(hdspe->card->dev,
+				"%s: hw_pointer jump delta=%llu > 4*period_size=%u (period_size=%u, hw_buf=%u).\n",
+				__func__, delta, hdspe->period_size * 4,
+				hdspe->period_size, hdspe->hw_buffer_size);
+		}
+		if (__ratelimit(&hdspe_fc_rs)) {
+			dev_info(hdspe->card->dev,
+				"%s: hw_pointer=%u (delta %llu), frame_count=%llu (delta=%llu)\n",
+				__func__, hw_pointer, delta,
+				hdspe->frame_count,
+				hdspe->frame_count - last_frame_count);
+		}
 		last_frame_count = hdspe->frame_count;
 		last_hw_pointer = hw_pointer;
 	}
 #endif /*DEBUG_FRAME_COUNT*/
-}
-
-static inline void hdspe_start_audio(struct hdspe * s)
-{
-	return;   /* we have audio interrupts enabled all the time */
-	if (s->tco) return;   /* always running with TCO */
-	s->reg.control.common.START = s->reg.control.common.IE_AUDIO = true;
-	hdspe_write_control(s);
-}
-
-static inline void hdspe_stop_audio(struct hdspe * s)
-{
-	return;   /* we leave audio interrupts enabled all the time */	
-	if (s->tco) return;   /* leave always running with TCO */
-	s->reg.control.common.START = s->reg.control.common.IE_AUDIO = false;
-	hdspe_write_control(s);
 }
 
 /* should I silence all or only opened ones ? doit all for first even is 4MB*/
@@ -291,7 +264,6 @@ static int snd_hdspe_hw_params(struct snd_pcm_substream *substream,
 {
 	struct hdspe *hdspe = snd_pcm_substream_chip(substream);
 	int err;
-	int i;
 	pid_t this_pid;
 	pid_t other_pid;
 
@@ -343,7 +315,7 @@ static int snd_hdspe_hw_params(struct snd_pcm_substream *substream,
 	spin_lock_irq(&hdspe->lock);
 	err = hdspe_set_sample_rate(hdspe, params_rate(params));
 	if (err < 0) {
-		dev_info(hdspe->card->dev, "err on hdspe_set_rate: %d\n", err);
+		dev_err(hdspe->card->dev, "error on hdspe_set_rate: %d\n", err);
 		spin_unlock_irq(&hdspe->lock);
 		_snd_pcm_hw_param_setempty(params,
 				SNDRV_PCM_HW_PARAM_RATE);
@@ -354,8 +326,8 @@ static int snd_hdspe_hw_params(struct snd_pcm_substream *substream,
 	err = hdspe_set_interrupt_interval(hdspe,
 			params_period_size(params));
 	if (err < 0) {
-		dev_info(hdspe->card->dev,
-			 "err on hdspe_set_interrupt_interval: %d\n", err);
+		dev_err(hdspe->card->dev,
+			"error on hdspe_set_interrupt_interval: %d\n", err);
 		_snd_pcm_hw_param_setempty(params,
 				SNDRV_PCM_HW_PARAM_PERIOD_SIZE);
 		return err;
@@ -371,63 +343,27 @@ static int snd_hdspe_hw_params(struct snd_pcm_substream *substream,
 	err =
 		snd_pcm_lib_malloc_pages(substream, HDSPE_DMA_AREA_BYTES);
 	if (err < 0) {
-		dev_info(hdspe->card->dev,
-			 "err on snd_pcm_lib_malloc_pages: %d\n", err);
+		dev_err(hdspe->card->dev,
+			"err on snd_pcm_lib_malloc_pages: %d\n", err);
 		return err;
 	}
 
-	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
-		/* Enable only the required DMA channels. */
-		for (i = 0; i < params_channels(params); ++i) {
-			int c = hdspe->channel_map_out[i];
-
-			if (c < 0)
-				continue;      /* just make sure */
-			hdspe_set_channel_dma_addr(hdspe, substream,
-						   HDSPE_pageAddressBufferOut,
-						   c);
-			snd_hdspe_enable_out(hdspe, c, 1);
-		}
-
-		hdspe->playback_buffer =
-			(unsigned char *) substream->runtime->dma_area;
-		dev_dbg(hdspe->card->dev,
-			"Allocated sample buffer for playback at %p\n",
-				hdspe->playback_buffer);
-	} else {
-		for (i = 0; i < params_channels(params); ++i) {
-			int c = hdspe->channel_map_in[i];
-
-			if (c < 0)
-				continue;
-			hdspe_set_channel_dma_addr(hdspe, substream,
-						   HDSPE_pageAddressBufferIn,
-						   c);
-			snd_hdspe_enable_in(hdspe, c, 1);
-		}
-
-		hdspe->capture_buffer =
-			(unsigned char *) substream->runtime->dma_area;
-		dev_dbg(hdspe->card->dev,
-			"Allocated sample buffer for capture at %p\n",
-				hdspe->capture_buffer);
-	}
+	/*
+	dev_dbg(hdspe->card->dev,
+	"Allocated sample buffer for %s at 0x%08X\n",
+	substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
+	"playback" : "capture",
+	snd_pcm_sgbuf_get_addr(substream, 0));
+	*/
 
 	/*
-	   dev_dbg(hdspe->card->dev,
-	   "Allocated sample buffer for %s at 0x%08X\n",
-	   substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
-	   "playback" : "capture",
-	   snd_pcm_sgbuf_get_addr(substream, 0));
-	   */
-	/*
-	   dev_dbg(hdspe->card->dev,
-	   "set_hwparams: %s %d Hz, %d channels, bs = %d\n",
-	   substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
-	   "playback" : "capture",
-	   params_rate(params), params_channels(params),
-	   params_buffer_size(params));
-	   */
+	dev_dbg(hdspe->card->dev,
+	"set_hwparams: %s %d Hz, %d channels, bs = %d\n",
+	substream->stream == SNDRV_PCM_STREAM_PLAYBACK ?
+	"playback" : "capture",
+	params_rate(params), params_channels(params),
+	params_buffer_size(params));
+	*/
 
 	/* Switch to native float format if requested, s32le otherwise. */
 	snd_hdspe_set_float_format(
@@ -445,12 +381,12 @@ static int snd_hdspe_hw_free(struct snd_pcm_substream *substream)
 		/* Just disable all channels. The saving when disabling a */
 		/* smaller set is not worth the trouble. */
 		for (i = 0; i < HDSPE_MAX_CHANNELS; ++i)
-			snd_hdspe_enable_out(hdspe, i, 0);
+			hdspe_set_dma_out(hdspe, i, false);
 
 		hdspe->playback_buffer = NULL;
 	} else {
 		for (i = 0; i < HDSPE_MAX_CHANNELS; ++i)
-			snd_hdspe_enable_in(hdspe, i, 0);
+			hdspe_set_dma_in(hdspe, i, false);
 
 		hdspe->capture_buffer = NULL;
 	}
@@ -534,12 +470,19 @@ static int snd_hdspe_trigger(struct snd_pcm_substream *substream, int cmd)
 	int running;
 
 	spin_lock(&hdspe->lock);
+	dev_dbg(hdspe->card->dev, "Trigger received with %d\n", cmd);
 	running = hdspe->running;
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+	// Takashi Iwai's ALSA driver guide suggests to keep the RESUME case for compatibility even if the
+	// SNDRV_PCM_INFO_RESUME flag is not set.
+	case SNDRV_PCM_TRIGGER_RESUME:
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		running |= 1 << substream->stream;
 		break;
 	case SNDRV_PCM_TRIGGER_STOP:
+	case SNDRV_PCM_TRIGGER_SUSPEND:
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
 		running &= ~(1 << substream->stream);
 		break;
 	default:
@@ -553,18 +496,19 @@ static int snd_hdspe_trigger(struct snd_pcm_substream *substream, int cmd)
 		other = hdspe->playback_substream;
 
 	if (other) {
+		bool stream_begins = cmd == SNDRV_PCM_TRIGGER_START || cmd == SNDRV_PCM_TRIGGER_RESUME || cmd == SNDRV_PCM_TRIGGER_PAUSE_RELEASE;
 		struct snd_pcm_substream *s;
 		snd_pcm_group_for_each_entry(s, substream) {
 			if (s == other) {
 				snd_pcm_trigger_done(s, substream);
-				if (cmd == SNDRV_PCM_TRIGGER_START)
+				if (stream_begins)
 					running |= 1 << s->stream;
 				else
 					running &= ~(1 << s->stream);
 				goto _ok;
 			}
 		}
-		if (cmd == SNDRV_PCM_TRIGGER_START) {
+		if (stream_begins) {
 			if (!(running & (1 << SNDRV_PCM_STREAM_PLAYBACK))
 					&& substream->stream ==
 					SNDRV_PCM_STREAM_CAPTURE)
@@ -580,10 +524,15 @@ static int snd_hdspe_trigger(struct snd_pcm_substream *substream, int cmd)
 	}
 _ok:
 	snd_pcm_trigger_done(substream, substream);
-	if (!hdspe->running && running)
-		hdspe_start_audio(hdspe);
-	else if (hdspe->running && !running)
-		hdspe_stop_audio(hdspe);
+	// Since we have audio interrupts enabled all the time,
+	// no explicit start or stop is necessary
+	if (!hdspe->running && running) {
+		dev_dbg(hdspe->card->dev, "Audio streaming started: %s, period=%u, rate=%u, irq_count=%d\n",
+		         substream->stream == SNDRV_PCM_STREAM_PLAYBACK ? "playback" : "capture", hdspe->period_size,
+		         hdspe_read_system_sample_rate(hdspe), hdspe->irq_count);
+	} else if (hdspe->running && !running) {
+		dev_dbg(hdspe->card->dev, "Audio streaming stopped: irq_count=%d\n", hdspe->irq_count);
+	}
 	hdspe->running = running;
 	spin_unlock(&hdspe->lock);
 
@@ -595,6 +544,30 @@ _ok:
 
 static int snd_hdspe_prepare(struct snd_pcm_substream *substream)
 {
+	struct hdspe *hdspe = snd_pcm_substream_chip(substream);
+	const struct snd_pcm_runtime *runtime = substream->runtime;
+	const bool playback = substream->stream == SNDRV_PCM_STREAM_PLAYBACK;
+	const unsigned int reg = playback ? HDSPE_pageAddressBufferOut : HDSPE_pageAddressBufferIn;
+	const s8 *map = playback ? hdspe->channel_map_out : hdspe->channel_map_in;
+
+	/* Reprogram per-channel DMA addresses. Redundant after hw_params on initial setup, but required on resume from suspend where the FPGA has lost this state. */
+	for (int i = 0; i < runtime->channels; ++i) {
+		const int c = map[i];
+		if (c < 0)
+			continue;
+
+		hdspe_set_channel_dma_addr(hdspe, substream, reg, c);
+		if (playback)
+			hdspe_set_dma_out(hdspe, c, true);
+		else
+			hdspe_set_dma_in(hdspe, c, true);
+	}
+
+	if (playback)
+		hdspe->playback_buffer = (unsigned char *) runtime->dma_area;
+	else
+		hdspe->capture_buffer = (unsigned char *) runtime->dma_area;
+
 	return 0;
 }
 
@@ -602,7 +575,8 @@ static const struct snd_pcm_hardware snd_hdspe_playback_subinfo = {
 	.info = (SNDRV_PCM_INFO_MMAP |
 		 SNDRV_PCM_INFO_MMAP_VALID |
 		 SNDRV_PCM_INFO_NONINTERLEAVED |
-		 SNDRV_PCM_INFO_SYNC_START | SNDRV_PCM_INFO_DOUBLE),
+		 SNDRV_PCM_INFO_SYNC_START |
+		 SNDRV_PCM_INFO_DOUBLE),
 	.formats = SNDRV_PCM_FMTBIT_S32_LE,
 //	.formats = SNDRV_PCM_FMTBIT_FLOAT_LE,	
 	.rates = (SNDRV_PCM_RATE_32000 |
@@ -841,15 +815,9 @@ static int snd_hdspe_open(struct snd_pcm_substream *substream)
 		snd_hdspe_capture_subinfo;
 
 	if (playback) {
-		if (!hdspe->capture_substream)
-			hdspe_stop_audio(hdspe);
-
 		hdspe->playback_pid = current->pid;
 		hdspe->playback_substream = substream;
 	} else {
-		if (!hdspe->playback_substream)
-			hdspe_stop_audio(hdspe);
-
 		hdspe->capture_pid = current->pid;
 		hdspe->capture_substream = substream;
 	}

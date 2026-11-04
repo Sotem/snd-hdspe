@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/**
+/*
  * hdspe-mixer.c
  * @brief RME HDSPe hardware mixer status and control interface.
  *
@@ -48,6 +48,7 @@ static int hdspe_write_in_gain(struct hdspe *hdspe, unsigned int chan,
 		    HDSPE_MADI_mixerBase +
 		    ((in + 128 * chan) * sizeof(u32)),
 		    cpu_to_le32(hdspe->mixer->ch[chan].in[in] = data & 0xFFFF));
+	hdspe->mixer_known[chan].in[in] = true;
 	return 0;
 }
 
@@ -61,6 +62,7 @@ static int hdspe_write_pb_gain(struct hdspe *hdspe, unsigned int chan,
 		    HDSPE_MADI_mixerBase +
 		    ((64 + pb + 128 * chan) * sizeof(u32)),
 		    (hdspe->mixer->ch[chan].pb[pb] = data & 0xFFFF));
+	hdspe->mixer_known[chan].pb[pb] = true;
 	return 0;
 }
 
@@ -78,10 +80,14 @@ void hdspe_mixer_read_proc(struct snd_info_entry *entry,
 	
 	for (i = 0; i < HDSPE_MIXER_CHANNELS; i++) {
 		snd_iprintf(buffer, "%02d: ", i);
-		for (j = 0; j < HDSPE_MIXER_CHANNELS; j++)
-			snd_iprintf(buffer, "%5u ",
+		for (j = 0; j < HDSPE_MIXER_CHANNELS; j++) {
+			if (hdspe->mixer_known[i].in[j])
+				snd_iprintf(buffer, "%5u ",
 				   hdspe_read_in_gain(hdspe, i, j));
-		snd_iprintf(buffer, "\n");		
+			else
+				snd_iprintf(buffer, "   -- ");
+		}
+		snd_iprintf(buffer, "\n");
 	}
 
 	snd_iprintf(buffer, "\nPlayback Volume:\n");
@@ -92,79 +98,30 @@ void hdspe_mixer_read_proc(struct snd_info_entry *entry,
 	
 	for (i = 0; i < HDSPE_MIXER_CHANNELS; i++) {
 		snd_iprintf(buffer, "%02d: ", i);
-		for (j = 0; j < HDSPE_MIXER_CHANNELS; j++)
-			snd_iprintf(buffer, "%5u ",
-				   hdspe_read_pb_gain(hdspe, i, j));
-		snd_iprintf(buffer, "\n");		
-	}
-}
-
-void hdspe_mixer_update_channel_map(struct hdspe* hdspe)
-{
-	int i, j;
-	bool used[HDSPE_MAX_CHANNELS];
-
-	dev_dbg(hdspe->card->dev, "%s:\n", __func__);
-	
-	/* mute all unused playback channels */
-	for (i = 0; i < HDSPE_MIXER_CHANNELS; i ++) {
-		used[i] = false;
-	}
-	for (i = 0; i < HDSPE_MIXER_CHANNELS; i ++) {
-		int c = hdspe->channel_map_out[i];
-		used[c] = true;
-	}
-	for (i = 0; i < HDSPE_MIXER_CHANNELS; i ++) {
-		if (!used[i]) {
-			for (j = 0; j < HDSPE_MIXER_CHANNELS; j ++) {
-				hdspe_write_in_gain(hdspe, i, j, 0);
-				hdspe_write_pb_gain(hdspe, i, j, 0);
-			}
-		} else {
-#ifdef DAW_MODE
-			hdspe_write_pb_gain(hdspe, i, i, HDSPE_UNITY_GAIN);
-#endif /*DAW_MODE*/
-		}
-	}
-	
-	/* mute all unused capture channels */
-	for (i = 0; i < HDSPE_MIXER_CHANNELS; i ++) {
-		used[i] = false;
-	}
-	for (i = 0; i < HDSPE_MIXER_CHANNELS; i ++) {
-		int c = hdspe->channel_map_in[i];
-		used[c] = true;
-	}
-	for (i = 0; i < HDSPE_MIXER_CHANNELS; i ++) {	
-		if (!used[i]) {
-			for (j = 0; j < HDSPE_MIXER_CHANNELS; j ++) {
-				hdspe_write_in_gain(hdspe, j, i, 0);
-			}
-		} else {
-#ifdef PASSTHROUGH_MODE
-			hdspe_write_in_gain(hdspe, i, i, HDSPE_UNITY_GAIN);
-#endif /*PASSTHROUGH_MODE*/
-		}		
-	}
-}
-
-static void hdspe_clear_mixer(struct hdspe * hdspe, u16 sgain)
-{
-	int i, j;
-	unsigned int gain;
-
-	if (sgain > HDSPE_UNITY_GAIN)
-		gain = HDSPE_UNITY_GAIN;
-	else if (sgain < 0)
-		gain = 0;
-	else
-		gain = sgain;
-
-	for (i = 0; i < HDSPE_MIXER_CHANNELS; i++)
 		for (j = 0; j < HDSPE_MIXER_CHANNELS; j++) {
-			hdspe_write_in_gain(hdspe, i, j, gain);
-			hdspe_write_pb_gain(hdspe, i, j, gain);
-		}	
+			if (hdspe->mixer_known[i].pb[j])
+				snd_iprintf(buffer, "%5u ",
+				   hdspe_read_pb_gain(hdspe, i, j));
+			else
+				snd_iprintf(buffer, "   -- ");
+		}
+		snd_iprintf(buffer, "\n");
+	}
+}
+
+/* Reapply all cached mixer volume values to hardware. */
+void hdspe_restore_mixer(struct hdspe *hdspe)
+{
+	for (unsigned int chan = 0; chan < HDSPE_MIXER_CHANNELS; chan++)
+	{
+		for (unsigned int in = 0; in < HDSPE_MIXER_CHANNELS; in++)
+			if (hdspe->mixer_known[chan].in[in])
+				hdspe_write_in_gain(hdspe, chan, in, hdspe->mixer->ch[chan].in[in]);
+
+		for (unsigned int pb = 0; pb < HDSPE_MIXER_CHANNELS; pb++)
+			if (hdspe->mixer_known[chan].pb[pb])
+				hdspe_write_pb_gain(hdspe, chan, pb, hdspe->mixer->ch[chan].pb[pb]);
+	}
 }
 
 #define HDSPE_MIXER(xname, xindex) \
@@ -231,6 +188,7 @@ static int snd_hdspe_put_mixer(struct snd_kcontrol *kcontrol,
 	int source;
 	int destination;
 	int gain;
+	bool known;
 
 	if (!snd_hdspe_use_is_exclusive(hdspe))
 		return -EBUSY;
@@ -247,15 +205,19 @@ static int snd_hdspe_put_mixer(struct snd_kcontrol *kcontrol,
 
 	spin_lock_irq(&hdspe->lock);
 
-	if (source >= HDSPE_MAX_CHANNELS)
+	if (source >= HDSPE_MAX_CHANNELS) {
 		change = gain != hdspe_read_pb_gain(hdspe, destination,
 						    source -
 						    HDSPE_MAX_CHANNELS);
-	else
+		known = hdspe->mixer_known[destination].pb[source -
+							  HDSPE_MAX_CHANNELS];
+	} else {
 		change = gain != hdspe_read_in_gain(hdspe, destination,
 						    source);
+		known = hdspe->mixer_known[destination].in[source];
+	}
 
-	if (change) {
+	if (change || !known) {
 		if (source >= HDSPE_MAX_CHANNELS)
 			hdspe_write_pb_gain(hdspe, destination,
 					    source - HDSPE_MAX_CHANNELS,
@@ -266,8 +228,90 @@ static int snd_hdspe_put_mixer(struct snd_kcontrol *kcontrol,
 	}
 	spin_unlock_irq(&hdspe->lock);
 
+	return change || !known;
+}
+
+/* Expose the full hardware mixer as matrix mixer, so alsactl can
+   control the complete mixer state.
+*/
+#define HDSPE_MIXER_MATRIX_VALUES (2 * HDSPE_MIXER_CHANNELS)
+
+static int snd_hdspe_info_matrix_mixer(struct snd_kcontrol *kcontrol,
+                                       struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type  = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = HDSPE_MIXER_MATRIX_VALUES;
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 65535;
+	uinfo->value.integer.step = 1;
+	return 0;
+}
+
+static int snd_hdspe_get_matrix_mixer(struct snd_kcontrol *kcontrol,
+                                      struct snd_ctl_elem_value *ucontrol)
+{
+	struct hdspe *hdspe = snd_kcontrol_chip(kcontrol);
+	unsigned int destination = snd_ctl_get_ioff(kcontrol, &ucontrol->id);
+	unsigned int source;
+
+	spin_lock_irq(&hdspe->lock);
+	for (source = 0; source < HDSPE_MIXER_CHANNELS; source++) {
+		ucontrol->value.integer.value[source] =
+				hdspe_read_in_gain(hdspe, destination, source);
+		ucontrol->value.integer.value[HDSPE_MIXER_CHANNELS + source] =
+				hdspe_read_pb_gain(hdspe, destination, source);
+	}
+	spin_unlock_irq(&hdspe->lock);
+
+	return 0;
+}
+
+static int snd_hdspe_put_matrix_mixer(struct snd_kcontrol *kcontrol,
+                                      struct snd_ctl_elem_value *ucontrol)
+{
+	struct hdspe *hdspe = snd_kcontrol_chip(kcontrol);
+	unsigned int destination = snd_ctl_get_ioff(kcontrol, &ucontrol->id);
+	unsigned int source;
+	const long *val = ucontrol->value.integer.value;
+	int change = 0;
+
+	if (!snd_hdspe_use_is_exclusive(hdspe))
+		return -EBUSY;
+
+	for (source = 0; source < HDSPE_MIXER_MATRIX_VALUES; source++)
+		if (val[source] < 0 || val[source] > 65535)
+			return -EINVAL;
+
+	spin_lock_irq(&hdspe->lock);
+	for (source = 0; source < HDSPE_MIXER_CHANNELS; source++) {
+		const long in = val[source];
+		const long pb = val[HDSPE_MIXER_CHANNELS + source];
+
+		if (in != hdspe_read_in_gain(hdspe, destination, source) ||
+		    !hdspe->mixer_known[destination].in[source]) {
+			hdspe_write_in_gain(hdspe, destination, source, in);
+			change = 1;
+		}
+		if (pb != hdspe_read_pb_gain(hdspe, destination, source) ||
+		    !hdspe->mixer_known[destination].pb[source]) {
+			hdspe_write_pb_gain(hdspe, destination, source, pb);
+			change = 1;
+		}
+	}
+	spin_unlock_irq(&hdspe->lock);
+
 	return change;
 }
+
+static const struct snd_kcontrol_new snd_hdspe_matrix_mixer = {
+	.iface  = SNDRV_CTL_ELEM_IFACE_HWDEP,
+	.name   = "Matrix Mixer",
+	.access = SNDRV_CTL_ELEM_ACCESS_READWRITE | SNDRV_CTL_ELEM_ACCESS_VOLATILE,
+	.count  = HDSPE_MIXER_CHANNELS,
+	.info   = snd_hdspe_info_matrix_mixer,
+	.get    = snd_hdspe_get_matrix_mixer,
+	.put    = snd_hdspe_put_matrix_mixer
+};
 
 /* The simple mixer control(s) provide gain control for the
    basic 1:1 mappings of playback streams to output
@@ -320,6 +364,7 @@ static int snd_hdspe_put_playback_mixer(struct snd_kcontrol *kcontrol,
 	int change;
 	int channel;
 	int gain;
+	bool known;
 
 	if (!snd_hdspe_use_is_exclusive(hdspe))
 		return -EBUSY;
@@ -335,11 +380,12 @@ static int snd_hdspe_put_playback_mixer(struct snd_kcontrol *kcontrol,
 	change =
 	    gain != hdspe_read_pb_gain(hdspe, channel,
 				       channel);
-	if (change)
+	known = hdspe->mixer_known[channel].pb[channel];
+	if (change || !known)
 		hdspe_write_pb_gain(hdspe, channel, channel,
 				    gain);
 	spin_unlock_irq(&hdspe->lock);
-	return change;
+	return change || !known;
 }
 
 static struct snd_kcontrol_new snd_hdspe_playback_mixer = HDSPE_PLAYBACK_MIXER;
@@ -396,6 +442,10 @@ int hdspe_create_mixer_controls(struct hdspe* hdspe)
 	if (err < 0)
 		return err;
 
+	err = hdspe_add_controls(hdspe, 1, &snd_hdspe_matrix_mixer);
+	if (err < 0)
+		return err;
+
  	/* create simple 1:1 playback mixer controls */
 	snd_hdspe_playback_mixer.name = "Chn";
 	limit = hdspe_nr_out_channels(hdspe);
@@ -421,7 +471,8 @@ int hdspe_init_mixer(struct hdspe* hdspe)
 	if (!hdspe->mixer)
 		return -ENOMEM;
 	
-	hdspe_clear_mixer(hdspe, 0 * HDSPE_UNITY_GAIN);
+	// Do not clear the mixer volume values. On Windows, the driver does not touch those. The userspace tool
+	// TotalMix handles that. This allows all routing to continue to exist after a reboot.
 	
 	return 0;
 }

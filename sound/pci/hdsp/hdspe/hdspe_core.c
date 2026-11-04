@@ -36,6 +36,7 @@
 
 #include "hdspe.h"
 #include "hdspe_core.h"
+#include "hdspe_version.h"
 
 #include <linux/init.h>
 #include <linux/module.h>
@@ -103,11 +104,51 @@ static const struct pci_device_id snd_hdspe_ids[] = {
 MODULE_DEVICE_TABLE(pci, snd_hdspe_ids);
 
 
+static u8 snd_hdspe_read_flash_byte(struct hdspe *hdspe, const u32 addr)
+{
+	u32 cmd = addr << 8;
+	if (hdspe->pci_rev_id >= HDSPE_AES_REV)
+		cmd |= 0x50000000;
+
+	// Write cmd into flash write register, later poll answer from read register with slight delay
+	hdspe_write(hdspe, HDSPE_WR_FLASH, cmd);
+
+	for (int i = 0; i < 2000; i++) {
+		const u32 status = le32_to_cpu(hdspe_read(hdspe, HDSPE_RD_FLASH));
+		if (!(status & 0x100))
+			return (u8)(status & 0xff);
+		udelay(10);
+	}
+
+	return 0;
+}
+
+static bool snd_hdspe_is_rev2(const struct hdspe *hdspe)
+{
+	// AIO Pro is a special case (only rev 2 board with firmware build below 200)
+	if (hdspe->pci_rev_id == HDSPE_AIO_REV)
+		return hdspe->vendor_id == PCI_VENDOR_ID_RME && hdspe->fw_build < 200;
+
+	// This is the default case, a firmware build starting from 200 with RME or Xilinx vendor ID indicates a rev 2 card
+	return (hdspe->vendor_id == PCI_VENDOR_ID_RME || hdspe->vendor_id == PCI_VENDOR_ID_XILINX) && hdspe->fw_build >= 200;
+}
+
 /* interrupt handler */
 static irqreturn_t snd_hdspe_interrupt(int irq, void *dev_id)
 {
 	struct hdspe *hdspe = (struct hdspe *) dev_id;
 	int i, audio, midi, schedule = 0;
+	#ifdef TIME_INTERRUPT_INTERVAL
+	if (hdspe->irq_count % 1000 == 0) {
+		dev_dbg(hdspe->card->dev, "Interrupt #%d received\n", hdspe->irq_count);
+	}
+	#endif /*TIME_INTERRUPT_INTERVAL*/
+
+	#ifdef DEBUG_IRQ_COUNT
+	static DEFINE_RATELIMIT_STATE(hdspe_irq_rs, HZ, 1);
+	static u16 last_buf_ptr;
+	static unsigned long last_buf_ptr_jiffies;
+	#endif
 
 	hdspe->reg.status0 = hdspe_read_status0_nocache(hdspe);
 
@@ -134,9 +175,47 @@ static irqreturn_t snd_hdspe_interrupt(int irq, void *dev_id)
 		return IRQ_NONE;
 
 	if (audio) {
+		#ifdef TIME_INTERRUPT_INTERVAL
+		if (hdspe->irq_count % 1000 == 0) {
+			dev_dbg(hdspe->card->dev, "Audio interrupt \n");
+		}
+		#endif /*TIME_INTERRUPT_INTERVAL*/
+
 		hdspe_write(hdspe, HDSPE_interruptConfirmation, 0);
 		hdspe->irq_count++;
-		
+
+		// Log on first IRQ to confirm card is working
+		if (hdspe->irq_count == 1) {
+			dev_info(hdspe->card->dev, "First audio IRQ received: LAT=%u BUF_ID=%u BUF_PTR=%u\n",
+			         hdspe->reg.control.common.LAT, hdspe->reg.status0.common.BUF_ID,
+			         le16_to_cpu(hdspe->reg.status0.common.BUF_PTR));
+		}
+
+		#ifdef DEBUG_IRQ_COUNT
+		if (__ratelimit(&hdspe_irq_rs)) {
+			dev_info(hdspe->card->dev,
+				"%s: irq_count=%d LAT=%u BUF_ID=%u BUF_PTR=%u running=%d\n",
+				__func__, hdspe->irq_count,
+				hdspe->reg.control.common.LAT,
+				hdspe->reg.status0.common.BUF_ID,
+				le16_to_cpu(hdspe->reg.status0.common.BUF_PTR),
+				hdspe->running);
+		}
+		{
+			u16 buf_ptr = le16_to_cpu(hdspe->reg.status0.common.BUF_PTR);
+			if (buf_ptr != last_buf_ptr) {
+				last_buf_ptr = buf_ptr;
+				last_buf_ptr_jiffies = jiffies;
+			} else if (last_buf_ptr_jiffies &&
+					time_after(jiffies, last_buf_ptr_jiffies + HZ)) {
+				dev_warn_ratelimited(hdspe->card->dev,
+					"%s: BUF_PTR stuck at %u for >=1s while audio IRQs occur (irq_count=%d).\n",
+					__func__, buf_ptr, hdspe->irq_count);
+				last_buf_ptr_jiffies = jiffies;
+			}
+		}
+		#endif /* DEBUG_IRQ_COUNT */
+
 		hdspe_update_frame_count(hdspe);
 
 		if (hdspe->tco) {
@@ -146,10 +225,27 @@ static irqreturn_t snd_hdspe_interrupt(int irq, void *dev_id)
 		}
 
 		if (hdspe->capture_substream)
+		{
 			snd_pcm_period_elapsed(hdspe->capture_substream);
+			#ifdef TIME_INTERRUPT_INTERVAL
+			if (hdspe->capture_buffer && hdspe->irq_count % 1000 == 0)
+			{
+			    dev_dbg(hdspe->card->dev, "Capture Buffer %d \n", *hdspe->capture_buffer);
+			}
+			#endif /*TIME_INTERRUPT_INTERVAL*/
+
+		}
 
 		if (hdspe->playback_substream)
+		{
 			snd_pcm_period_elapsed(hdspe->playback_substream);
+			#ifdef TIME_INTERRUPT_INTERVAL
+			if (hdspe->playback_buffer && hdspe->irq_count % 1000 == 0)
+			{
+				dev_dbg(hdspe->card->dev, "Playback Buffer %d \n", *hdspe->playback_buffer);
+			}
+			#endif /*TIME_INTERRUPT_INTERVAL*/
+		}
 
 		/* status polling at user controlled rate */
 		if (hdspe->status_polling > 0 &&
@@ -161,6 +257,12 @@ static irqreturn_t snd_hdspe_interrupt(int irq, void *dev_id)
 	}
 
 	if (midi) {
+		#ifdef TIME_INTERRUPT_INTERVAL
+		if (hdspe->irq_count % 1000 == 0) {
+			dev_dbg(hdspe->card->dev, "MIDI interrupt \n");
+		}
+		#endif /*TIME_INTERRUPT_INTERVAL*/
+
 		schedule = 0;
 		for (i = 0; i < hdspe->midiPorts; i++) {
 			if ((hdspe_read(hdspe,
@@ -187,29 +289,41 @@ static irqreturn_t snd_hdspe_interrupt(int irq, void *dev_id)
  * are enabled when the MIDI devices are created. */
 static void hdspe_start_interrupts(struct hdspe* hdspe)
 {
-	if (hdspe->tco) {
-		/* TCO MTC port is always the last one */
-		struct hdspe_midi *m = &hdspe->midi[hdspe->midiPorts-1];
-	
-		dev_dbg(hdspe->card->dev,
-			"%s: enabling TCO MTC input port %d '%s'.\n",
-			__func__, m->id, m->portname);
-		hdspe->reg.control.raw |= m->ie;	
+	/* Re-enable all MIDI interrupts for ports with open input */
+	for (int i = 0; i < hdspe->midiPorts; i++) {
+		if (hdspe->midi[i].input) {
+			dev_dbg(hdspe->card->dev,
+			        "%s: enabling MIDI input port %d '%s'.\n",
+			        __func__, hdspe->midi[i].id, hdspe->midi[i].portname);
+
+			hdspe->reg.control.raw |= hdspe->midi[i].ie;
+		}
 	}
 
-	hdspe->reg.control.common.START =
+	hdspe->reg.control.common.START    = true;
 	hdspe->reg.control.common.IE_AUDIO = true;
 
 	hdspe_write_control(hdspe);
+	dev_dbg(hdspe->card->dev, "Interrupts have been started\n");
 }
 
 static void hdspe_stop_interrupts(struct hdspe* hdspe)
 {
 	/* stop the audio, and cancel all interrupts */
-	hdspe->reg.control.common.START =
+	hdspe->reg.control.common.START    = false;
 	hdspe->reg.control.common.IE_AUDIO = false;
-	hdspe->reg.control.raw &= ~hdspe->midiInterruptEnableMask;
+	hdspe->reg.control.raw            &= ~hdspe->midiInterruptEnableMask;
+
 	hdspe_write_control(hdspe);
+	dev_dbg(hdspe->card->dev, "Interrupts have been stopped\n");
+}
+
+static void hdspe_disable_all_dma(struct hdspe *hdspe)
+{
+	for (int i = 0; i < HDSPE_MAX_CHANNELS; i++) {
+		hdspe_set_dma_out(hdspe, i, false);
+		hdspe_set_dma_in(hdspe, i, false);
+	}
 }
 
 /* Create ALSA devices, after hardware initialization */
@@ -243,15 +357,7 @@ static int snd_hdspe_create_alsa_devices(struct snd_card *card,
 	dev_dbg(card->dev, "Init proc interface...\n");
 	snd_hdspe_proc_init(hdspe);
 
-	dev_dbg(card->dev, "Initializing complete?\n");
-
-	err = snd_card_register(card);
-	if (err < 0) {
-		dev_err(card->dev, "error registering card.\n");
-		return err;
-	}
-	
-	dev_dbg(card->dev, "... yes now\n");
+	dev_dbg(card->dev, "Initializing done.\n");
 
 	return 0;
 }
@@ -277,6 +383,11 @@ static int hdspe_init(struct hdspe* hdspe)
 	hdspe->reg.control.common.freq = HDSPE_FREQ_44_1KHZ;
 	hdspe->reg.control.common.LineOut = true;
 	hdspe_write_control(hdspe);
+
+	/* Disable all DMAs to avoid a warm reboot still holding state
+	 * left by the previous OS (e.g. Windows) causing noise on all
+	 * I/Os. DMA will be enabled later in snd_hdspe_prepare(). */
+	hdspe_disable_all_dma(hdspe);
 
 	switch (hdspe->io_type) {
 	case HDSPE_MADI    :
@@ -313,23 +424,36 @@ static void hdspe_terminate(struct hdspe* hdspe)
 /* get card serial number - for older cards */
 static uint32_t snd_hdspe_get_serial_rev1(struct hdspe* hdspe)
 {
-	uint32_t serial = 0;
 	if (hdspe->io_type == HDSPE_MADIFACE)
 		return 0;
-	
-	serial = (hdspe_read(hdspe, HDSPE_midiStatusIn0)>>8) & 0xFFFFFF;
-	/* id contains either a user-provided value or the default
-	 * NULL. If it's the default, we're safe to
-	 * fill card->id with the serial number.
-	 *
-	 * If the serial number is 0xFFFFFF, then we're dealing with
-	 * an old PCI revision that comes without a sane number. In
-	 * this case, we don't set card->id to avoid collisions
-	 * when running with multiple cards.
-	 */
-	if (id[hdspe->dev] || serial == 0xFFFFFF) {
-		serial = 0;
+
+	uint32_t serial = 0;
+	dev_dbg(hdspe->card->dev, "Getting rev 1 serial");
+
+	for (int i = 0; i < 8; i++) {
+		const u32 flash_size = 0x80000;
+		const u8 c = snd_hdspe_read_flash_byte(hdspe, flash_size + 9 + i);
+		if (c >= '0' && c <= '9')
+			serial = serial * 10 + (c - '0');
 	}
+
+	if (!serial) {
+		const u32 tmp = le32_to_cpu(hdspe_read(hdspe, HDSPE_midiStatusIn0));
+		serial = (tmp >> 8) & 0xFFFFFF;
+		/* id contains either a user-provided value or the default
+		 * NULL. If it's the default, we're safe to
+		 * fill card->id with the serial number.
+		 *
+		 * If the serial number is 0xFFFFFF, then we're dealing with
+		 * an old PCI revision that comes without a sane number. In
+		 * this case, we don't set card->id to avoid collisions
+		 * when running with multiple cards.
+		 */
+		if (id[hdspe->dev] || serial == 0xFFFFFF)
+			serial = 0;
+		dev_dbg(hdspe->card->dev, "Got serial via old MIDI status");
+	}
+
 	return serial;
 }
 
@@ -337,6 +461,7 @@ static uint32_t snd_hdspe_get_serial_rev1(struct hdspe* hdspe)
 static uint32_t snd_hdspe_get_serial_rev2(struct hdspe* hdspe)
 {
 	uint32_t serial = 0;
+	dev_dbg(hdspe->card->dev, "Getting rev 2 serial");
 
 	// TODO: test endianness issues
 	/* get the serial number from the RD_BARCODE{0,1} registers */
@@ -358,29 +483,68 @@ static uint32_t snd_hdspe_get_serial_rev2(struct hdspe* hdspe)
 	return serial;
 }
 
-/* Get card model. TODO: check against Mac and windows driver */
-static enum hdspe_io_type hdspe_get_io_type(int pci_vendor_id, int firmware_rev)
+/* Get card model. Verified against Windows driver source (Jan 2026). */
+static enum hdspe_io_type hdspe_get_io_type(const int pci_vendor_id, const u8 pci_rev_id, const u32 firmware_build)
 {
-	switch (firmware_rev) {
+	switch (pci_rev_id) {
 	case HDSPE_RAYDAT_REV:
 		return HDSPE_RAYDAT;
 	case HDSPE_AIO_REV:
-		return (pci_vendor_id == PCI_VENDOR_ID_RME) ?
-			HDSPE_AIO_PRO : HDSPE_AIO;
+		// AIO Pro belongs to the HDSPe rev2 series (Artix FPGA), AIO (non-Pro) is rev1 only.
+		// AIO Pro has vendor=RME and build<200. There is no AIO Pro firmware with
+		// Xilinx vendor ID, so Xilinx vendor = AIO.
+		// Build>=200 with RME vendor = AIO.
+		// See: https://rme-audio.de/downloads/hdspeaio_e.pdf page 39,
+		//      https://www.forum.rme-audio.de/viewtopic.php?id=23315
+		if (pci_vendor_id == PCI_VENDOR_ID_XILINX)
+			return HDSPE_AIO;
+		if (firmware_build >= 200)
+			return HDSPE_AIO;
+		return HDSPE_AIO_PRO;
 	case HDSPE_MADIFACE_REV:
 		return HDSPE_MADIFACE;
+	case HDSPE_MADI_REV:
+		return HDSPE_MADI;
+	case HDSPE_AES_REV:
+		return HDSPE_AES;
 	default:
-		if ((firmware_rev == 0xf0) ||
-		    ((firmware_rev >= 0xe6) &&
-		     (firmware_rev <= 0xea))) {
+		if (pci_rev_id >= 0xe6 && pci_rev_id <= 0xea) {
 			return HDSPE_AES;
-		} else if ((firmware_rev == 0xd2) ||
-			   ((firmware_rev >= 0xc8)  &&
-			    (firmware_rev <= 0xcf))) {
+		}
+		if (pci_rev_id >= 0xc8 && pci_rev_id <= 0xcf) {
 			return HDSPE_MADI;
 		}
 	}
 	return HDSPE_IO_TYPE_INVALID;
+}
+
+static void hdspe_work_start(struct hdspe *hdspe)
+{
+	spin_lock_init(&hdspe->lock);
+	INIT_WORK(&hdspe->midi_work, hdspe_midi_work);
+	INIT_WORK(&hdspe->status_work, hdspe_status_work);
+}
+
+static int hdspe_init_all(struct hdspe *hdspe)
+{
+	int err;
+
+	/* Mixer */
+	err = hdspe_init_mixer(hdspe);
+	if (err < 0)
+		return err;
+
+	/* TCO */
+	err = hdspe_init_tco(hdspe);
+	if (err < 0)
+		return err;
+
+	/* Methods, tables, registers */
+	err = hdspe_init(hdspe);
+	if (err < 0)
+		return err;
+
+	return 0;
 }
 
 static int snd_hdspe_create(struct hdspe *hdspe)
@@ -394,30 +558,22 @@ static int snd_hdspe_create(struct hdspe *hdspe)
 	hdspe->port = 0;
 	hdspe->iobase = NULL;
 
-	spin_lock_init(&hdspe->lock);
-	INIT_WORK(&hdspe->midi_work, hdspe_midi_work);
-	INIT_WORK(&hdspe->status_work, hdspe_status_work);
+	hdspe_work_start(hdspe);
 
-	pci_read_config_word(hdspe->pci,
-			PCI_CLASS_REVISION, &hdspe->firmware_rev);
+	pci_read_config_byte(hdspe->pci,
+			PCI_REVISION_ID, &hdspe->pci_rev_id);
 	hdspe->vendor_id = pci->vendor;
 
-	dev_dbg(card->dev,
-		"PCI vendor %04x, device %04x, class revision %x\n",
-		pci->vendor, pci->device, hdspe->firmware_rev);
-	
+	dev_info(card->dev,
+		"PCI vendor %04x, device %04x, pci revision id %x\n",
+		pci->vendor, pci->device, hdspe->pci_rev_id);
+#ifdef SND_HDSPE_GIT_HASH
+	dev_info(card->dev, "driver version %s (git %s)\n",
+		SND_HDSPE_VERSION, SND_HDSPE_GIT_HASH);
+#endif
+
 	strcpy(card->mixername, "RME HDSPe");
 	strcpy(card->driver, "HDSPe");
-
-	/* Determine card model */
-	hdspe->io_type = hdspe_get_io_type(hdspe->vendor_id,
-					   hdspe->firmware_rev);
-	if (hdspe->io_type == HDSPE_IO_TYPE_INVALID) {
-		dev_err(card->dev,
-			"unknown firmware revision %d (0x%x)\n",
-			hdspe->firmware_rev, hdspe->firmware_rev);
-		return -ENODEV;
-	}
 
 	/* PCI */
 	err = pci_enable_device(pci);
@@ -467,6 +623,12 @@ static int snd_hdspe_create(struct hdspe *hdspe)
 			(unsigned long)hdspe->iobase, hdspe->port,
 			hdspe->port + io_extent - 1);
 
+	/* Stop any interrupts left running by the previous OS (e.g. Windows
+	 * leaves START=1 and its DMA buffers in the card's state).
+	 * Doing this as early as possible so the card doesn't have garbage
+	 * noise in its I/O */
+	hdspe_stop_interrupts(hdspe);
+
 	if (request_irq(pci->irq, snd_hdspe_interrupt,
 			IRQF_SHARED, KBUILD_MODNAME, hdspe)) {
 		dev_err(card->dev, "unable to use IRQ %d\n", pci->irq);
@@ -482,8 +644,19 @@ static int snd_hdspe_create(struct hdspe *hdspe)
 	hdspe->fw_build = le32_to_cpu(hdspe_read(hdspe, HDSPE_RD_FLASH)) >> 12;
 	dev_dbg(card->dev, "firmware build %d\n", hdspe->fw_build);
 
+	/* Determine card model */
+	hdspe->io_type = hdspe_get_io_type(hdspe->vendor_id,
+	                                   hdspe->pci_rev_id,
+	                                   hdspe->fw_build);
+	if (hdspe->io_type == HDSPE_IO_TYPE_INVALID) {
+		dev_err(card->dev,
+			"unknown pci revision id %d (0x%x)\n",
+			hdspe->pci_rev_id, hdspe->pci_rev_id);
+		return -ENODEV;
+	}
+
 	/* Serial number */
-	if (pci->vendor == PCI_VENDOR_ID_RME || hdspe->fw_build >= 200)
+	if (snd_hdspe_is_rev2(hdspe))
 		hdspe->serial = snd_hdspe_get_serial_rev2(hdspe);
 	else
 		hdspe->serial = snd_hdspe_get_serial_rev1(hdspe);
@@ -498,18 +671,8 @@ static int snd_hdspe_create(struct hdspe *hdspe)
 		dev_warn(card->dev, "Card ID not set: no serial number.\n");
 	}
 
-	/* Mixer */
-	err = hdspe_init_mixer(hdspe);
-	if (err < 0)
-		return err;
-
-	/* TCO */
-	err = hdspe_init_tco(hdspe);
-	if (err < 0)
-		return err;
-
-	/* Methods, tables, registers */
-	err = hdspe_init(hdspe);
+	/* Init all HDSPe things like TCO, methods, tables, registers ... */
+	err = hdspe_init_all(hdspe);
 	if (err < 0)
 		return err;
 
@@ -537,16 +700,41 @@ static int snd_hdspe_create(struct hdspe *hdspe)
 	return 0;
 }
 
-static int snd_hdspe_free(struct hdspe * hdspe)
+static void hdspe_work_stop(struct hdspe *hdspe)
 {
-	if (hdspe->port) {
+	if (hdspe->port)
+	{
 		hdspe_stop_interrupts(hdspe);
 		cancel_work_sync(&hdspe->midi_work);
 		cancel_work_sync(&hdspe->status_work);
+
+		/* Stop all MIDI timers */
+		for (int i = 0; i < hdspe->midiPorts; i++) {
+			if (hdspe->midi[i].istimer) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 2, 0)
+				timer_delete_sync(&hdspe->midi[i].timer);
+#else
+				del_timer_sync(&hdspe->midi[i].timer);
+#endif
+			}
+		}
+	}
+}
+
+static void hdspe_deinit_all(struct hdspe *hdspe)
+{
+	if (hdspe->port)
+	{
 		hdspe_terminate(hdspe);
 		hdspe_terminate_tco(hdspe);
 		hdspe_terminate_mixer(hdspe);
 	}
+}
+
+static int snd_hdspe_free(struct hdspe * hdspe)
+{
+	hdspe_work_stop(hdspe);
+	hdspe_deinit_all(hdspe);
 
 	if (hdspe->irq >= 0)
 		free_irq(hdspe->irq, (void *) hdspe);
@@ -624,11 +812,133 @@ static void snd_hdspe_remove(struct pci_dev *pci)
 	snd_card_free(pci_get_drvdata(pci));
 }
 
+static void snd_hdspe_shutdown(struct pci_dev *pci)
+{
+	struct snd_card *card = pci_get_drvdata(pci);
+	struct hdspe *hdspe;
+
+	if (!card)
+		return;
+
+	hdspe = card->private_data;
+	hdspe_stop_interrupts(hdspe);
+	hdspe_disable_all_dma(hdspe);
+}
+
+static int __maybe_unused snd_hdspe_suspend(struct pci_dev *dev, pm_message_t state)
+{
+	/* (1) Accessing HDSPe data */
+	struct snd_card *card = pci_get_drvdata(dev);
+	if (!card) {
+		return -ENODEV;
+	}
+
+	struct hdspe *hdspe = card->private_data;
+	if (!hdspe) {
+		return -ENODEV;
+	}
+
+	dev_dbg(hdspe->card->dev, "HDSPe entering suspend state\n");
+
+	/* (2) Change ALSA power state */
+	snd_power_change_state(card, SNDRV_CTL_POWER_D3hot);
+
+	/* (3) Save register values */
+	/* Save the necessary register values in hdspe struct */
+	spin_lock_irq(&hdspe->lock);
+	// without suspendStateRegs, it's 104e9 vs 104c8 for the control register -> because of the interrupts (START & IE_AUDIO)
+	hdspe->suspendStateRegs.control = hdspe->reg.control;
+	hdspe->suspendStateRegs.pll_freq = hdspe->reg.pll_freq;
+	hdspe->suspendStateRegs.settings = hdspe->reg.settings;
+	spin_unlock_irq(&hdspe->lock);
+
+	/* (4) Stop hardware operations */
+	/* Suspend all active PCM streams */
+	snd_pcm_suspend_all(hdspe->pcm);
+	/* Stop interrupts and halt any ongoing operations */
+	hdspe_work_stop(hdspe);
+	// snd_hdspe_deinit_all(hdspe);
+
+	/* (5) Enter low-power state */
+	/* Place the hardware into a low-power mode, not sure if that is available for HDSPe? */
+	/* pci_save_state() is also handled by the PCI core's legacy PM code. Still keeping it to be explicit */
+	pci_save_state(dev);
+	pci_set_power_state(dev, PCI_D3hot);
+
+	dev_dbg(hdspe->card->dev, "HDSPe suspend complete\n");
+	return 0;
+}
+
+static int __maybe_unused snd_hdspe_resume(struct pci_dev *dev)
+{
+	/* (1) Accessing HDSPe data */
+	struct snd_card *card = pci_get_drvdata(dev);
+	if (!card) {
+		return -ENODEV;
+	}
+
+	struct hdspe *hdspe = card->private_data;
+	if (!hdspe) {
+		return -ENODEV;
+	}
+
+	dev_dbg(hdspe->card->dev, "HDSPe entering resume state\n");
+
+	/* (2) Reinitialize the chip */
+	/* Perform any necessary reinitialization steps after resume */
+	/* pci_set_power_state() and pci_restore_state are also handled by the PCI core's legacy PM code.
+	 * Still keeping it to be explicit */
+	pci_set_power_state(dev, PCI_D0);
+	pci_restore_state(dev);
+
+	/* (3) Restore saved register values */
+	/* Restore the register values saved during suspend */
+	spin_lock_irq(&hdspe->lock);
+	hdspe->reg.control = hdspe->suspendStateRegs.control;
+	hdspe->reg.pll_freq = hdspe->suspendStateRegs.pll_freq;
+	hdspe->reg.settings = hdspe->suspendStateRegs.settings;
+	spin_unlock_irq(&hdspe->lock);
+
+	/* (4) Update hardware with restored register values */
+	/* Write restored register values to the hardware */
+	hdspe_write_settings(hdspe);
+	hdspe_write_control(hdspe);
+	hdspe_write_pll_freq(hdspe);
+	hdspe_restore_mixer(hdspe);
+	if (hdspe->tco)
+		hdspe_tco_write_settings(hdspe);
+
+	/* (5) Restart the chip or hardware */
+	/* Restart any halted hardware or operations */
+	// Technically, this redundantly sets START and IE_AUDIO in
+	// reg.control.common to true, which already happened via
+	// hdspe->suspendStateRegs
+	hdspe_start_interrupts(hdspe);
+	/* Re-arm all MIDI timers that were stopped in snd_hdspe_suspend */
+	for (int i = 0; i < hdspe->midiPorts; i++) {
+		if (hdspe->midi[i].istimer) {
+			mod_timer(&hdspe->midi[i].timer, 1 + jiffies);
+		}
+	}
+
+	/* (6) Return ALSA to full power state */
+	snd_power_change_state(card, SNDRV_CTL_POWER_D0);
+
+	dev_dbg(&dev->dev, "HDSPe resume complete\n");
+	dev_dbg(&dev->dev, "HDSPe running status:%d\n", hdspe_is_running(hdspe));
+	return 0;
+}
+
 static struct pci_driver hdspe_driver = {
 	.name = KBUILD_MODNAME,
 	.id_table = snd_hdspe_ids,
 	.probe = snd_hdspe_probe,
 	.remove = snd_hdspe_remove,
+	.shutdown = snd_hdspe_shutdown,
+#ifdef CONFIG_PM
+	.suspend = snd_hdspe_suspend,
+	.resume = snd_hdspe_resume,
+#endif
 };
 
 module_pci_driver(hdspe_driver);

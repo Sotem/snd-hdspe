@@ -47,7 +47,7 @@ This builds the snd-hdspe.ko kernel driver in the sound/pci/hdsp/hdspe subdirect
 
 or
 
-      sudo make insert
+      make insert
 
 You need to stop all (audio) applications using the snd-hdspm driver before, in particular PulseAudio and the jack audio server.
 
@@ -56,15 +56,7 @@ When manually inserting a non-signed kernel module like this, you may need to di
 See below for how to install the kernel module using DKMS. Installing with DKMS
 is preferred if you plan to use this module on a regular basis instead of just
 testing it once.
-    
-- In case you would love or need to see the debug messages spit out by the snd-hdspe.ko module, enable debug log output:
 
-      sudo echo 8 > /proc/sys/kernel/printk
-
-or
-
-      sudo make enable-debug-log
-    
 - Removing the snd-hdspe.ko driver and re-installing the default snd-hdspm driver:
 
       sudo -s 
@@ -73,7 +65,7 @@ or
 
 or
 
-      sude make remove
+      make remove
 
 - Viewing ALSA controls:
 
@@ -99,26 +91,56 @@ assists module signing for secure boot.
 
         sudo apt install dkms
 
-- For preparation, execute cd to your clone copy folder, then type
-
-        sudo ln -s $(pwd) /usr/src/alsa-hdspe-0.0
-
-- For installing, type
-
-        sudo dkms install alsa-hdspe/0.0
-
-- For uninstalling, type
-
-        sudo dkms remove alsa-hdspe/0.0
-
-- Or simply:
+- For installing, simply run:
 
         make install
 
-or
+  This will:
+  1. Build the module
+  2. Copy all relevant files to /usr/src/snd-hdspe-${PackageVersion}
+  3. Install the module with DKMS
+
+Note, if `dkms status` lists `alsa-hdspe`, you have to uninstall it first using `dkms remove alsa-hdspe/0.0 --all`.
+
+- For uninstalling, run:
 
         make uninstall
-      
+
+  This will remove the currently installed snd-hdspe module using DKMS as well as the source files copied to `/usr/src` from the `install` target.
+
+**Debugging**  
+
+In case you want to see debug messages from the snd-hdspe.ko module, you'll have to compile the driver with debug flags and enable debug logging in the kernel.  
+First, compile the driver with the debug flags:
+
+      make clean
+      make debug
+
+Then, install/reinstall the driver (temporarily until reboot:  
+```
+# Stopping some services first may be required on modern Distros like Fedora 44
+systemctl --user stop pipewire pipewire-pulse wireplumber
+sudo systemctl stop alsa-state.service 
+
+# Then, uninstall and install the driver (only until reboot)
+sudo rmmod snd_hdspe
+sudo insmod ./snd-hdspe.ko
+
+# Start the services via systemctl if you stopped them previously   
+```
+This will enable debug messages via `/proc` like `/proc/asound/{devicename}/debug`.
+
+To enable debug logging in the kernel via `dmesg`:
+
+    sudo -i
+    # run as root
+    sudo echo 8 > /proc/sys/kernel/printk
+
+or
+
+    echo 8 | sudo tee /proc/sys/kernel/printk
+
+The changes will take effect immediately and default back after a reboot.
 
 **Documentation**
 
